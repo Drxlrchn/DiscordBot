@@ -20,8 +20,8 @@ load_dotenv(find_dotenv())
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 
-# ----------------- Load & build docs (WITH section metadata) -----------------
-DOC_PATH = os.getenv("DOC_PATH", "documents.txt")  # <-- this must contain "### Section: ..."
+# ----------------- Load & build docs -----------------
+DOC_PATH = os.getenv("DOC_PATH", "documents.txt")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 800))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 200))
 
@@ -31,17 +31,15 @@ print(f"[DEBUG] Using document file: {abs_doc_path}")
 with open(DOC_PATH, "r", encoding="utf-8") as f:
     raw_text = f.read()
 
-# Parse: split by "### Section: <title>"
 pattern = r"### Section:\s*(.*)"
 parts = re.split(pattern, raw_text)
 
-# parts: [before, header1, text1, header2, text2, ...]
 sections = []
 docs = []
 splitter = CharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
 
 for i in range(1, len(parts), 2):
-    header = parts[i].strip()                               # e.g. "Week 1 – Page 3"
+    header = parts[i].strip()
     content = parts[i + 1].strip() if i + 1 < len(parts) else ""
     sections.append(header)
     for chunk in splitter.split_text(content):
@@ -52,7 +50,7 @@ if sections[:5]:
     print("[DEBUG] First 5 section titles:", sections[:5])
 print(f"[DEBUG] Total chunks indexed: {len(docs)}")
 
-# ----------------- Vector DB (rebuild fresh every run) -----------------
+# ----------------- Vector DB (auto-wipe) -----------------
 persist_dir = "db_sections"
 if os.path.exists(persist_dir):
     shutil.rmtree(persist_dir)
@@ -68,8 +66,8 @@ chat = ChatOpenAI(temperature=0, openai_api_key=OPENAI_API_KEY)
 QA_PROMPT = PromptTemplate(
     template=(
         "You are a trading mentor AI. Use the context below to answer the question clearly and helpfully.\n"
-        "If the answer is not in the context, say:\n"
-        "'I couldn’t find this directly in our mentorship material. But based on my experience, here’s what I can share:'\n\n"
+        "If the answer is not in the context, say exactly:\n"
+        "\"I couldn’t find this directly in our mentorship material. But based on my knowledge, here’s what I can share:\"\n\n"
         "Context:\n{context}\n\nQuestion: {question}\nAnswer:"
     ),
     input_variables=["context", "question"],
@@ -96,7 +94,7 @@ async def on_ready():
 async def ask(interaction: discord.Interaction, question: str):
     q_lower = question.lower()
 
-    # Fast date/time utilities
+    # Quick answers (skip LLM)
     if "year" in q_lower:
         return await interaction.response.send_message(
             f"The current year is {datetime.datetime.now().year}.", ephemeral=True
@@ -110,6 +108,7 @@ async def ask(interaction: discord.Interaction, question: str):
             f"The current time is {datetime.datetime.now().strftime('%I:%M %p')}.", ephemeral=True
         )
 
+    # Defer once — no double acknowledgement
     await interaction.response.defer(ephemeral=True)
 
     try:
@@ -119,18 +118,21 @@ async def ask(interaction: discord.Interaction, question: str):
         response = await asyncio.to_thread(run_chain)
         answer = response["result"].strip()
 
-        # Pull unique section names from metadata
+        # Collect unique section names
         sections_used = []
         for doc in response.get("source_documents", []):
             sec = doc.metadata.get("section")
             if sec and sec not in sections_used:
                 sections_used.append(sec)
 
-        if sections_used:
+        disclaimer = "\n\n*_(Adam can make mistakes. Always verify important info.)_*"
+
+        # Only show “Read more” if answer didn’t fall back
+        if sections_used and "I couldn’t find this directly" not in answer:
             bullets = "\n".join(f"• *{s}*" for s in sections_used)
-            msg = f"**Question:** {question}\n\n**Answer:** {answer}\n\n*Read more:*\n{bullets}"
+            msg = f"**Question:** {question}\n\n**Answer:** {answer}\n\n*Read more:*\n{bullets}{disclaimer}"
         else:
-            msg = f"**Question:** {question}\n\n**Answer:** {answer}"
+            msg = f"**Question:** {question}\n\n**Answer:** {answer}{disclaimer}"
 
         await interaction.followup.send(msg, ephemeral=True)
 
