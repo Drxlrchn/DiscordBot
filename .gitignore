@@ -1,0 +1,5 @@
+.env
+db_sections/
+__pycache__/
+*.sqlite*
+*.bin
