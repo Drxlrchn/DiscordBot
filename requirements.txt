@@ -1,0 +1,6 @@
+discord.py
+python-dotenv
+langchain-community
+langchain-openai
+chromadb
+PyPDF2
