@@ -1,5 +1,9 @@
-.env
+# never commit vector DBs or caches
 db_sections/
+db/
 __pycache__/
 *.sqlite*
 *.bin
+*.pkl
+*.log
+.env
