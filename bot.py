@@ -1,3 +1,5 @@
+print("[DEBUG] bot.py version: 2025-09-30-02:30")  # <— debug marker to verify deployment
+
 import os
 import re
 import shutil
