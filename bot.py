@@ -1,4 +1,4 @@
-print("[DEBUG] bot.py version: 2025-10-01-04:00 with memory")  # debug marker to verify deployment
+print("[DEBUG] bot.py version: 2025-10-01-19:30")  # debug marker to verify deployment
 
 import os
 import re
@@ -13,8 +13,9 @@ from dotenv import load_dotenv, find_dotenv
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.text_splitter import CharacterTextSplitter
-from langchain.chains import RetrievalQA
+from langchain.chains import ConversationalRetrievalChain
 from langchain.prompts import PromptTemplate
+from langchain.memory import ConversationBufferMemory
 from langchain_core.documents import Document
 
 # ----------------- Env -----------------
@@ -60,18 +61,19 @@ if os.path.exists(persist_dir):
 embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
 db = Chroma.from_documents(docs, embeddings, persist_directory=persist_dir)
 db.persist()
-retriever = db.as_retriever(search_kwargs={"k": 5})
+retriever = db.as_retriever(search_kwargs={"k": 8})  # bumped to k=8 for broader context
+
+# ----------------- Memory -----------------
+memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
 # ----------------- LLM & QA chain -----------------
 chat = ChatOpenAI(temperature=0, openai_api_key=OPENAI_API_KEY)
 
 QA_PROMPT = PromptTemplate(
     template=(
-        "You are Adam, a friendly **community support AI**. "
-        "When the user asks casual questions (like 'hi', 'who are you', 'how are you', 'what time is it'), "
-        "respond naturally and warmly like ChatGPT, not like a mentor.\n\n"
-        "When the user asks about topics from the mentorship material, behave like a helpful coach or teacher. "
-        "Use the context below to give a clear, detailed answer. Summarize and explain, not just copy.\n"
+        "You are Adam AI, a friendly **community support assistant** for our trading program. "
+        "Answer in a supportive and clear way, like a helpful coach but not making promises. "
+        "Use the context below to answer as accurately and usefully as possible.\n\n"
         "If the answer is not in the context, say exactly:\n"
         "\"I couldn’t find this directly in our mentorship material. But based on my knowledge, here’s what I can share:\"\n\n"
         "Context:\n{context}\n\nQuestion: {question}\nAnswer:"
@@ -79,44 +81,36 @@ QA_PROMPT = PromptTemplate(
     input_variables=["context", "question"],
 )
 
-qa_chain = RetrievalQA.from_chain_type(
+qa_chain = ConversationalRetrievalChain.from_llm(
     llm=chat,
     retriever=retriever,
-    chain_type="stuff",
+    memory=memory,
     return_source_documents=True,
-    chain_type_kwargs={"prompt": QA_PROMPT},
+    combine_docs_chain_kwargs={"prompt": QA_PROMPT},
+    output_key="answer"  # so memory stores only answer
 )
 
 # ----------------- Discord bot -----------------
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# simple in-memory store for recent user history
-user_history = {}
-
 @bot.event
 async def on_ready():
     synced = await bot.tree.sync()
     print(f"Bot {bot.user} is online. Slash commands synced: {[c.name for c in synced]}")
 
-@bot.tree.command(name="ask", description="Ask Adam AI privately (ephemeral)")
+@bot.tree.command(name="ask", description="Ask Adam AI (friendly community support)")
 async def ask(interaction: discord.Interaction, question: str):
     q_lower = question.lower()
 
-    # Friendly direct answers for obvious casual Qs
-    if any(greet in q_lower for greet in ["hello", "hi", "hey", "yo"]):
+    # Quick answers (friendly casual)
+    if "who are you" in q_lower:
         return await interaction.response.send_message(
-            "Hey there! How can I help you today?", ephemeral=True
-        )
-    if "who are you" in q_lower or "are you adam" in q_lower:
-        return await interaction.response.send_message(
-            "Yes, I’m Adam, your friendly community support AI. How can I assist you today?",
-            ephemeral=True
+            "I'm Adam AI, your friendly community support assistant for our trading program 😊", ephemeral=True
         )
     if "how are you" in q_lower:
         return await interaction.response.send_message(
-            "I’m doing great, thanks for asking! How can I support you today?",
-            ephemeral=True
+            "I'm doing great and ready to help! How can I assist you today?", ephemeral=True
         )
     if "year" in q_lower:
         return await interaction.response.send_message(
@@ -124,24 +118,20 @@ async def ask(interaction: discord.Interaction, question: str):
         )
     if "date" in q_lower or "day" in q_lower:
         return await interaction.response.send_message(
-            f"Today is {datetime.date.today().strftime('%A, %B %d, %Y')}.", ephemeral=True
+            f"Today's date is {datetime.date.today().strftime('%A, %B %d, %Y')}.", ephemeral=True
         )
     if "time" in q_lower:
         return await interaction.response.send_message(
             f"The current time is {datetime.datetime.now().strftime('%I:%M %p')}.", ephemeral=True
         )
 
-    # Otherwise go to LLM with retrieval
+    # Defer once
     await interaction.response.defer(ephemeral=True)
 
     try:
-        def run_chain():
-            return qa_chain.invoke({"query": question})
+        response = await asyncio.to_thread(lambda: qa_chain.invoke({"question": question}))
+        answer = response["answer"].strip()
 
-        response = await asyncio.to_thread(run_chain)
-        answer = response["result"].strip()
-
-        # Collect unique section names
         sections_used = []
         for doc in response.get("source_documents", []):
             sec = doc.metadata.get("section")
@@ -150,6 +140,7 @@ async def ask(interaction: discord.Interaction, question: str):
 
         disclaimer = "\n\n*_(Adam can make mistakes. Always verify important info.)_*"
 
+        # Only show “Read more” if answer didn’t fall back
         if sections_used and "I couldn’t find this directly" not in answer:
             bullets = "\n".join(f"• *{s}*" for s in sections_used)
             msg = f"**Question:** {question}\n\n**Answer:** {answer}\n\n*Read more:*\n{bullets}{disclaimer}"
