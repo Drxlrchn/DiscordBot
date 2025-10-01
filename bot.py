@@ -1,9 +1,8 @@
-print("[DEBUG] bot.py version: 2025-10-02-router")  # debug marker to verify deployment
+print("[DEBUG] bot.py version: 2025-10-02-router-fixed")  # debug marker
 
 import os
 import re
 import shutil
-import datetime
 import asyncio
 from typing import Dict, Optional
 
@@ -22,13 +21,13 @@ from langchain_core.documents import Document
 # ----------------- Env -----------------
 load_dotenv(find_dotenv())
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-DISCORD_TOKEN  = os.environ.get("DISCORD_TOKEN")
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 
 # ----------------- Config -----------------
-DOC_PATH       = os.getenv("DOC_PATH", "documents.txt")
-CHUNK_SIZE     = int(os.getenv("CHUNK_SIZE", 800))
-CHUNK_OVERLAP  = int(os.getenv("CHUNK_OVERLAP", 200))
-RETRIEVER_K    = int(os.getenv("RETRIEVER_K", 8))
+DOC_PATH = os.getenv("DOC_PATH", "documents.txt")
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 800))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 200))
+RETRIEVER_K = int(os.getenv("RETRIEVER_K", 8))
 
 DISCLAIMER = "\n\n*_(Adam can make mistakes. Always verify important info.)_*"
 
@@ -38,7 +37,7 @@ FALLBACK_SNIPPET = (
 )
 
 # ----------------- Tiny in-process memory (per run) -----------------
-USER_PROFILE: Dict[int, Dict[str, str]] = {}   # {user_id: {"name": "drex"}}
+USER_PROFILE: Dict[int, Dict[str, str]] = {}  # {user_id: {"name": "drex"}}
 
 # ----------------- Load & build docs -----------------
 abs_doc_path = os.path.abspath(DOC_PATH)
@@ -55,7 +54,7 @@ docs = []
 splitter = CharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
 
 for i in range(1, len(parts), 2):
-    header  = parts[i].strip()
+    header = parts[i].strip()
     content = parts[i + 1].strip() if i + 1 < len(parts) else ""
     sections.append(header)
     for chunk in splitter.split_text(content):
@@ -74,7 +73,6 @@ db = Chroma.from_documents(docs, embeddings, persist_directory=persist_dir)
 retriever = db.as_retriever(search_kwargs={"k": RETRIEVER_K})
 
 # ----------------- Models -----------------
-# One model object is fine for router + answers (temperature 0 keeps it steady).
 chat = ChatOpenAI(temperature=0, openai_api_key=OPENAI_API_KEY)
 
 # Router prompt: return strictly CASUAL or MATERIAL
@@ -88,7 +86,6 @@ Question: {question}
 Label:"""
 
 def classify_query(question: str) -> str:
-    """LLM router → returns 'CASUAL' or 'MATERIAL' (default CASUAL on parse issues)."""
     try:
         out = chat.invoke(ROUTER_PROMPT.format(question=question.strip()))
         label = (out.content or "").strip().upper()
@@ -98,6 +95,7 @@ def classify_query(question: str) -> str:
         return "CASUAL"
 
 # MATERIAL prompt (retrieval)
+from langchain.prompts import PromptTemplate
 QA_PROMPT = PromptTemplate(
     template=(
         "You are Adam AI, a friendly community support assistant for a trading mentorship.\n"
@@ -110,6 +108,7 @@ QA_PROMPT = PromptTemplate(
     input_variables=["context", "question"],
 )
 
+from langchain.chains import RetrievalQA
 qa_chain = RetrievalQA.from_chain_type(
     llm=chat,
     retriever=retriever,
@@ -118,7 +117,6 @@ qa_chain = RetrievalQA.from_chain_type(
     chain_type_kwargs={"prompt": QA_PROMPT},
 )
 
-# CASUAL answer prompt (no retrieval)
 CASUAL_PROMPT = """You are Adam AI, a friendly *community support* assistant for a trading mentorship.
 Reply in a brief, warm tone (1–3 sentences). Be helpful and human—no formalities.
 If the user asked the time/date/day/year, answer directly.
@@ -135,7 +133,6 @@ def casual_answer(question: str, name: Optional[str]) -> str:
         print("[CASUAL ERROR]", e)
         return (greet + "How can I help you today?" + DISCLAIMER).strip()
 
-# ----------------- Misc helpers -----------------
 def extract_name(text: str) -> Optional[str]:
     t = text.strip().lower()
     for p in [r"my name is\s+(.+)", r"call me\s+(.+)", r"you can call me\s+(.+)", r"i am\s+(.+)", r"i'm\s+(.+)"]:
@@ -156,48 +153,46 @@ async def on_ready():
     synced = await bot.tree.sync()
     print(f"Bot {bot.user} is online. Slash commands synced: {[c.name for c in synced]}")
 
-# ----------------- /ask command -----------------
-@bot.tree.command(name="ask", description="Ask Adam AI (Adam routes casual vs material automatically).")
+# ----------------- /ask command (always defer) -----------------
+@bot.tree.command(
+    name="ask",
+    description="Ask anything under the sun, Adam is here to help 🌞"
+)
 async def ask(interaction: discord.Interaction, question: str):
     uid = interaction.user.id
-    q   = question.strip()
+    q = question.strip()
 
-    # Capture name if user tells it
+    await interaction.response.defer(ephemeral=True)
+
     name_from_user = extract_name(q)
     if name_from_user:
         USER_PROFILE.setdefault(uid, {})["name"] = name_from_user
-        return await interaction.response.send_message(
+        return await interaction.followup.send(
             f"Nice to meet you, **{name_from_user}**! I’ll use that name in this session. 😊",
             ephemeral=True,
         )
 
-    # Decide route (CASUAL or MATERIAL)
     route = classify_query(q)
     print(f"[DEBUG] Router label: {route}")
 
-    # CASUAL → answer immediately; MATERIAL → defer and retrieve
-    if route == "CASUAL":
-        name = USER_PROFILE.get(uid, {}).get("name")
-        text = casual_answer(q, name)
-        return await interaction.response.send_message(text, ephemeral=True)
-
-    # MATERIAL path
-    await interaction.response.defer(ephemeral=True)
     try:
+        if route == "CASUAL":
+            name = USER_PROFILE.get(uid, {}).get("name")
+            text = casual_answer(q, name)
+            return await interaction.followup.send(text, ephemeral=True)
+
         def run_chain():
             return qa_chain.invoke({"query": q})
 
         response = await asyncio.to_thread(run_chain)
         answer = (response.get("answer") or response.get("result") or "").strip()
 
-        # sections used (unique)
         sections_used = []
         for doc in response.get("source_documents", []):
             sec = doc.metadata.get("section")
             if sec and sec not in sections_used:
                 sections_used.append(sec)
 
-        # Prefix greeting if we know the name
         name = USER_PROFILE.get(uid, {}).get("name")
         prefix = f"Hey **{name}**!\n\n" if name else ""
 
@@ -213,5 +208,4 @@ async def ask(interaction: discord.Interaction, question: str):
         print("[ERROR]", e)
         await interaction.followup.send("⚠️ Sorry, I was unable to process your question.", ephemeral=True)
 
-# ----------------- Run -----------------
 bot.run(DISCORD_TOKEN)
