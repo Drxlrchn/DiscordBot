@@ -1,4 +1,4 @@
-print("[DEBUG] bot.py version: 2025-10-02-router-fixed")  # debug marker
+print("[DEBUG] bot.py version: 2025-10-02-router-defensive")  # debug marker
 
 import os
 import re
@@ -23,6 +23,9 @@ load_dotenv(find_dotenv())
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 
+# Useful to distinguish logs if you accidentally run two instances
+INSTANCE_TAG = os.getenv("INSTANCE_TAG", "local")
+
 # ----------------- Config -----------------
 DOC_PATH = os.getenv("DOC_PATH", "documents.txt")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 800))
@@ -41,7 +44,7 @@ USER_PROFILE: Dict[int, Dict[str, str]] = {}  # {user_id: {"name": "drex"}}
 
 # ----------------- Load & build docs -----------------
 abs_doc_path = os.path.abspath(DOC_PATH)
-print(f"[DEBUG] Using document file: {abs_doc_path}")
+print(f"[{INSTANCE_TAG}] [DEBUG] Using document file: {abs_doc_path}")
 
 with open(DOC_PATH, "r", encoding="utf-8") as f:
     raw_text = f.read()
@@ -60,8 +63,8 @@ for i in range(1, len(parts), 2):
     for chunk in splitter.split_text(content):
         docs.append(Document(page_content=chunk, metadata={"section": header}))
 
-print(f"[DEBUG] Sections found: {len(sections)}")
-print(f"[DEBUG] Total chunks indexed: {len(docs)}")
+print(f"[{INSTANCE_TAG}] [DEBUG] Sections found: {len(sections)}")
+print(f"[{INSTANCE_TAG}] [DEBUG] Total chunks indexed: {len(docs)}")
 
 # ----------------- Vector DB (auto-wipe fresh) -----------------
 persist_dir = "db_sections"
@@ -86,16 +89,16 @@ Question: {question}
 Label:"""
 
 def classify_query(question: str) -> str:
+    """LLM router → returns 'CASUAL' or 'MATERIAL' (default CASUAL on parse issues)."""
     try:
         out = chat.invoke(ROUTER_PROMPT.format(question=question.strip()))
         label = (out.content or "").strip().upper()
         return "MATERIAL" if "MATERIAL" in label else "CASUAL"
     except Exception as e:
-        print("[ROUTER ERROR]", e)
+        print(f"[{INSTANCE_TAG}] [ROUTER ERROR]", e)
         return "CASUAL"
 
 # MATERIAL prompt (retrieval)
-from langchain.prompts import PromptTemplate
 QA_PROMPT = PromptTemplate(
     template=(
         "You are Adam AI, a friendly community support assistant for a trading mentorship.\n"
@@ -108,7 +111,6 @@ QA_PROMPT = PromptTemplate(
     input_variables=["context", "question"],
 )
 
-from langchain.chains import RetrievalQA
 qa_chain = RetrievalQA.from_chain_type(
     llm=chat,
     retriever=retriever,
@@ -117,6 +119,7 @@ qa_chain = RetrievalQA.from_chain_type(
     chain_type_kwargs={"prompt": QA_PROMPT},
 )
 
+# CASUAL answer prompt (no retrieval)
 CASUAL_PROMPT = """You are Adam AI, a friendly *community support* assistant for a trading mentorship.
 Reply in a brief, warm tone (1–3 sentences). Be helpful and human—no formalities.
 If the user asked the time/date/day/year, answer directly.
@@ -130,7 +133,8 @@ def casual_answer(question: str, name: Optional[str]) -> str:
         out = chat.invoke(CASUAL_PROMPT.format(question=question.strip()))
         return (greet + (out.content or "").strip() + DISCLAIMER).strip()
     except Exception as e:
-        print("[CASUAL ERROR]", e)
+        print(f"[{INSTANCE_TAG}] [CASUAL ERROR]", e)
+        greet = f"Hey **{name}**! " if name else ""
         return (greet + "How can I help you today?" + DISCLAIMER).strip()
 
 def extract_name(text: str) -> Optional[str]:
@@ -144,16 +148,47 @@ def extract_name(text: str) -> Optional[str]:
 def is_fallback(text: str) -> bool:
     return "couldn't find this directly" in (text or "").lower()
 
+# ----------- Response helpers to avoid double-ack ----------------
+async def send_or_followup(interaction: discord.Interaction, content: str, ephemeral: bool = True):
+    """
+    If initial response hasn't been sent, use response.send_message.
+    Otherwise, use followup.send. This prevents 'already acknowledged' errors.
+    """
+    try:
+        if not interaction.response.is_done():
+            return await interaction.response.send_message(content, ephemeral=ephemeral)
+        else:
+            return await interaction.followup.send(content, ephemeral=ephemeral)
+    except discord.HTTPException as e:
+        print(f"[{INSTANCE_TAG}] [SEND ERROR] {e}")
+        # As a last resort, swallow to avoid crashing the handler.
+        return None
+
+async def safe_defer(interaction: discord.Interaction, ephemeral: bool = True):
+    """
+    Defer only if not already acknowledged. Guard against 40060.
+    """
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral)
+            print(f"[{INSTANCE_TAG}] [DEBUG] deferred=True")
+        else:
+            print(f"[{INSTANCE_TAG}] [DEBUG] deferred=skipped (already acknowledged)")
+    except discord.HTTPException as e:
+        # If defer fails due to being already acknowledged, just log and proceed.
+        print(f"[{INSTANCE_TAG}] [DEFER ERROR] {e}")
+
 # ----------------- Discord bot -----------------
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
+    # Sync global commands (or switch to guild-specific during dev to avoid cache lag)
     synced = await bot.tree.sync()
-    print(f"Bot {bot.user} is online. Slash commands synced: {[c.name for c in synced]}")
+    print(f"[{INSTANCE_TAG}] Bot {bot.user} is online. Slash commands synced: {[c.name for c in synced]}")
 
-# ----------------- /ask command (always defer) -----------------
+# ----------------- /ask command (defensive) -----------------
 @bot.tree.command(
     name="ask",
     description="Ask anything under the sun, Adam is here to help 🌞"
@@ -162,25 +197,30 @@ async def ask(interaction: discord.Interaction, question: str):
     uid = interaction.user.id
     q = question.strip()
 
-    await interaction.response.defer(ephemeral=True)
-
+    # 1) Instant branch: if the user is telling us their name, reply immediately (no defer)
     name_from_user = extract_name(q)
     if name_from_user:
         USER_PROFILE.setdefault(uid, {})["name"] = name_from_user
-        return await interaction.followup.send(
+        return await send_or_followup(
+            interaction,
             f"Nice to meet you, **{name_from_user}**! I’ll use that name in this session. 😊",
             ephemeral=True,
         )
 
+    # 2) For everything else, defer early (but only if not already acknowledged)
+    await safe_defer(interaction, ephemeral=True)
+
+    # 3) Heavy work after defer
     route = classify_query(q)
-    print(f"[DEBUG] Router label: {route}")
+    print(f"[{INSTANCE_TAG}] [DEBUG] Router label: {route} | response_done={interaction.response.is_done()}")
 
     try:
         if route == "CASUAL":
             name = USER_PROFILE.get(uid, {}).get("name")
             text = casual_answer(q, name)
-            return await interaction.followup.send(text, ephemeral=True)
+            return await send_or_followup(interaction, text, ephemeral=True)
 
+        # MATERIAL path
         def run_chain():
             return qa_chain.invoke({"query": q})
 
@@ -202,10 +242,11 @@ async def ask(interaction: discord.Interaction, question: str):
         else:
             msg = f"{prefix}**Question:** {q}\n\n**Answer:** {answer}{DISCLAIMER}"
 
-        await interaction.followup.send(msg, ephemeral=True)
+        await send_or_followup(interaction, msg, ephemeral=True)
 
     except Exception as e:
-        print("[ERROR]", e)
-        await interaction.followup.send("⚠️ Sorry, I was unable to process your question.", ephemeral=True)
+        print(f"[{INSTANCE_TAG}] [ERROR]", e)
+        await send_or_followup(interaction, "⚠️ Sorry, I was unable to process your question.", ephemeral=True)
 
+# ----------------- Run -----------------
 bot.run(DISCORD_TOKEN)
